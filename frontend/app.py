@@ -1,120 +1,80 @@
 import streamlit as st
-import io
-import pdfplumber
-import os
-import json
-# from openai import OpenAI
-# For cost sake we use Groq instead
-from groq import Groq
-from dotenv import load_dotenv
+import requests
+from datetime import datetime
 
-load_dotenv()
+BACKEND_URL = "http://localhost:8000"
 
-client = Groq(api_key=os.environ.get("GROQ_API_KEY"))
-# client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
-
-st.set_page_config(page_title="Job Application Assistant", layout="wide")
+# ── PAGE SETUP ────────────────────────────────────────────────────────────────
+st.set_page_config(page_title="Job Application Assistant")
 st.title("Job Application Assistant")
-st.caption(
-    "Upload your CV and a job description — get a tailored rewrite in seconds.")
+st.write("Upload your CV and paste a job description to get a match score, missing skills, a tailored CV, and a cover letter.")
 
+# ── INPUT SECTION ─────────────────────────────────────────────────────────────
+st.subheader("Your CV")
+cv_file = st.file_uploader("Upload your CV (PDF only)", type=["pdf"])
 
-# PDF EXTRACTION
-def extract_text_from_pdf(file_bytes: bytes) -> str:
-    with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
-        return "\n".join(page.extract_text() or "" for page in pdf.pages)
+st.subheader("Job Description")
+job_description = st.text_area("Job Description", placeholder="Paste the job description here")
 
+# ── ANALYSE BUTTON ────────────────────────────────────────────────────────────
+if st.button("Analyse My Application"):
 
-def analyse(cv_text: str, job_description: str) -> dict:
-    prompt = f"""You are an expert CV writer and career coach.
-
-Given the CV and job description below, return a JSON object with exactly these four keys:
-- "match_score": integer 0-100 showing how well the CV matches the job
-- "missing_skills": list of strings — skills in the job description not present in the CV
-- "rewritten_cv": string — the full CV rewritten to match the job description language and requirements
-- "cover_letter": string — a tailored cover letter for this specific role
-
-CV:
-{cv_text}
-
-Job Description:
-{job_description}
-
-Return only valid JSON, no extra text."""
-
-    response = client.chat.completions.create(
-        model="qwen/qwen3-32b",
-        messages=[{"role": "user", "content": prompt}],
-        response_format={"type": "json_object"},
-        temperature=0.7,
-    )
-    return json.loads(response.choices[0].message.content)
-
-
-# Sidebar: history placeholder
-
-with st.sidebar:
-
-    st.header("Past Analyses")
-
-    st.info("History will appear here once the database is connected.")
-
-# Main form - Concept: Layout primitives — st.columns, file uploader, text area.
-
-col1, col2 = st.columns(2)
-
-with col1:
-    cv_file = st.file_uploader("Upload your CV (PDF)", type=["pdf"])
-
-with col2:
-    job_description = st.text_area("Paste the job description", height=300)
-
-# ACTION BUTTON WITH INPUT VALIDATION
-run = st.button(
-    "Analyse",
-    type="primary",
-    disabled=(cv_file is None or not job_description.strip()),
-)
-
-# WIRE EXTRACTION INTO THE FLOW WITH FEEDBACK AND GUARDS
-if run:
-    with st.spinner("Extracting CV text..."):
-        cv_text = extract_text_from_pdf(cv_file.getvalue())
-
-    if not cv_text.strip():
-        st.error(
-            "Could not extract text from the PDF. Make sure it is not a scanned image.")
-        st.stop()
-
-    with st.spinner("Analysing — this takes a few seconds..."):
-        try:
-            result = analyse(cv_text, job_description)
-        except Exception as e:
-            st.error(f"AI call failed: {e}")
-            st.stop()
-
-    st.success("Analysis complete!")
-
-    score = result.get("match_score", 0)
-    colour = "green" if score >= 70 else "orange" if score >= 40 else "red"
-    st.markdown(f"### Match Score: :{colour}[{score}%]")
-
-    st.subheader("Missing Skills")
-    skills = result.get("missing_skills", [])
-    if skills:
-        for skill in skills:
-            st.markdown(f"- {skill}")
+    # ── VALIDATION ────────────────────────────────────────────────────────────
+    if not cv_file:
+        st.warning("Please upload your CV as a PDF.")
+    elif not job_description.strip():
+        st.warning("Please enter a job description.")
     else:
-        st.write("No critical gaps found.")
+        # ── SEND TO BACKEND ───────────────────────────────────────────────────
+        with st.spinner("Analysing your application..."):
+            try:
+                response = requests.post(
+                    f"{BACKEND_URL}/analyse",
+                    files={"cv_file": (cv_file.name, cv_file.getvalue(), "application/pdf")},
+                    data={"job_description": job_description}
+                )
 
-    tab1, tab2 = st.tabs(["Rewritten CV", "Cover Letter"])
+                if response.status_code == 200:
+                    result = response.json()
 
-    with tab1:
+                    # ── DISPLAY RESULTS ───────────────────────────────────────
+                    st.success("Analysis complete!")
 
-        st.text_area("Copy your rewritten CV", value=result.get(
-            "rewritten_cv", ""), height=400)
+                    st.metric(label="Match Score", value=result["match_score"])
 
-    with tab2:
+                    st.subheader("Missing Skills")
+                    for skill in result["missing_skills"]:
+                        st.write(f"• {skill}")
 
-        st.text_area("Copy your cover letter", value=result.get(
-            "cover_letter", ""), height=400)
+                    with st.expander("Rewritten CV"):
+                       st.text_area("Rewritten CV", value=result["rewritten_cv"], height=400, label_visibility="collapsed")
+
+                    with st.expander("Cover Letter"):
+                        st.text_area("Cover Letter", value=result["cover_letter"], height=300, label_visibility="collapsed")
+
+                else:
+                    st.error(f"Error from backend: {response.json().get('detail', 'Unknown error')}")
+
+            except Exception as e:
+                st.error(f"Could not connect to backend: {str(e)}")
+                # ── HISTORY SECTION ───────────────────────────────────────────────────────────
+st.divider()
+if st.button("View History"):
+    try:
+        response = requests.get(f"{BACKEND_URL}/history")
+        if response.status_code == 200:
+            history = response.json()
+            if not history:
+                st.info("No analyses saved yet.")
+            else:
+                st.subheader("Past Analyses")
+                for item in history:
+                    with st.expander(f"#{item['id']} — {item['match_score']} — {item['created_at'][:10]}"):
+                        st.write(f"**Match Score:** {item['match_score']}")
+                        st.write(f"**Missing Skills:** {item['missing_skills']}")
+                        date = datetime.fromisoformat(item["created_at"]).strftime("%d %b %Y, %H:%M")
+                        st.write(f"**Date:** {date}")
+        else:
+            st.error("Could not load history.")
+    except Exception as e:
+        st.error(f"Could not connect to backend: {str(e)}")
